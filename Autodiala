@@ -1,0 +1,219 @@
+bot.py
+import os
+import csv
+import re
+from dotenv import load_dotenv
+from telegram.ext import Application, CommandHandler, MessageHandler, filters
+from contacts import contacts
+
+load_dotenv()
+TOKEN = os.getenv("TELEGRAM_TOKEN")
+
+# --- Load contacts ---
+def load_contacts():
+    if os.path.exists("leads.csv"):
+        with open("leads.csv", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            return [{"name": row["name"].strip(), "phone": row["phone"].strip(), "status": "idle", "note": ""} for row in reader]
+    else:
+        from contacts import contacts
+        return [{"status": "idle", "note": "", **c} for c in contacts]
+
+queue = load_contacts()
+state = {"index": None, "active": False, "log": []}
+
+def current():
+    i = state["index"]
+    return queue[i] if i is not None else None
+
+def next_idle(from_idx=None):
+    start = (from_idx if from_idx is not None else (state["index"] if state["index"] is not None else -1)) + 1
+    for i in range(start, len(queue)):
+        if queue[i]["status"] == "idle":
+            return i
+    return None
+
+def stats_text():
+    done      = len([c for c in queue if c["status"] == "completed"])
+    skipped   = len([c for c in queue if c["status"] == "skipped"])
+    remaining = len([c for c in queue if c["status"] == "idle"])
+    return f"✅ Done: {done}   ⇥ Skipped: {skipped}   🔵 Remaining: {remaining}"
+
+async def cmd_start(update, ctx):
+    i = next_idle(-1)
+    if i is None:
+        await update.message.reply_text("📭 Queue is empty. Use /reset to start over.")
+        return
+    state["index"] = i
+    state["active"] = True
+    c = queue[i]
+    total = len(queue)
+    await update.message.reply_text(
+        f"📞 *Call {i+1} of {total}*\n\n"
+        f"👤 *{c['name']}*\n"
+        f"📱 `{c['phone']}`\n\n"
+        f"{stats_text()}\n\n"
+        f"_Dial manually, then use:_\n"
+        f"/end — mark complete\n"
+        f"/end [note] — complete with note\n"
+        f"/skip — skip this contact\n"
+        f"/pause — pause session",
+        parse_mode="Markdown"
+    )
+
+async def cmd_end(update, ctx):
+    c = current()
+    if not c:
+        await update.message.reply_text("No active call. Use /start.")
+        return
+    note = " ".join(ctx.args) if ctx.args else ""
+    c["status"] = "completed"
+    c["note"] = note
+    state["log"].append({"name": c["name"], "phone": c["phone"], "status": "completed", "note": note})
+    msg = f"✅ *Completed: {c['name']}*"
+    if note:
+        msg += f"\n📝 _{note}_"
+    await update.message.reply_text(msg, parse_mode="Markdown")
+    await _advance(update)
+
+async def cmd_skip(update, ctx):
+    c = current()
+    if not c:
+        await update.message.reply_text("No active call. Use /start.")
+        return
+    c["status"] = "skipped"
+    state["log"].append({"name": c["name"], "phone": c["phone"], "status": "skipped", "note": ""})
+    await update.message.reply_text(f"⇥ Skipped *{c['name']}*", parse_mode="Markdown")
+    await _advance(update)
+
+async def _advance(update):
+    i = next_idle()
+    if i is None:
+        state["active"] = False
+        done    = len([c for c in queue if c["status"] == "completed"])
+        skipped = len([c for c in queue if c["status"] == "skipped"])
+        await update.message.reply_text(
+            f"🎉 *Session complete!*\n\n"
+            f"✅ Completed: {done}\n"
+            f"⇥ Skipped:   {skipped}\n\n"
+            f"Use /log to see your notes\n"
+            f"Use /export to save as CSV\n"
+            f"Use /reset to run again",
+            parse_mode="Markdown"
+        )
+    else:
+        state["index"] = i
+        c = queue[i]
+        total = len(queue)
+        await update.message.reply_text(
+            f"📞 *Next — Call {i+1} of {total}*\n\n"
+            f"👤 *{c['name']}*\n"
+            f"📱 `{c['phone']}`\n\n"
+            f"{stats_text()}",
+            parse_mode="Markdown"
+        )
+
+async def cmd_pause(update, ctx):
+    state["active"] = False
+    c = current()
+    msg = "⏸ *Session paused.*\n\nSend /start to resume"
+    if c:
+        msg += f" from *{c['name']}*"
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+async def cmd_status(update, ctx):
+    c = current()
+    msg = f"📊 *Queue Status*\n\n{stats_text()}"
+    if c:
+        msg += f"\n\n📞 Current: *{c['name']}* — `{c['phone']}`"
+    elif not state["active"]:
+        msg += "\n\n💤 No active session"
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+async def cmd_log(update, ctx):
+    if not state["log"]:
+        await update.message.reply_text("📋 No calls logged yet.")
+        return
+    lines = []
+    for i, e in enumerate(state["log"], 1):
+        icon = "✅" if e["status"] == "completed" else "⇥"
+        line = f"{i}. {icon} *{e['name']}*\n    `{e['phone']}`"
+        if e["note"]:
+            line += f"\n    📝 _{e['note']}_"
+        lines.append(line)
+    await update.message.reply_text(
+        f"📋 *Call Log ({len(state['log'])} calls)*\n\n" + "\n\n".join(lines),
+        parse_mode="Markdown"
+    )
+
+async def cmd_export(update, ctx):
+    if not state["log"]:
+        await update.message.reply_text("Nothing to export yet.")
+        return
+    filepath = "results.csv"
+    with open(filepath, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["name", "phone", "status", "note"])
+        writer.writeheader()
+        writer.writerows(state["log"])
+    await update.message.reply_document(
+        document=open(filepath, "rb"),
+        filename="autodial_results.csv",
+        caption=f"📤 {len(state['log'])} calls exported"
+    )
+
+async def cmd_reset(update, ctx):
+    global queue
+    for c in queue:
+        c["status"] = "idle"
+        c["note"] = ""
+    state.update({"index": None, "active": False, "log": []})
+    await update.message.reply_text(
+        f"↺ *Queue reset* — {len(queue)} contacts ready\n\nSend /start to begin.",
+        parse_mode="Markdown"
+    )
+
+async def cmd_reload(update, ctx):
+    global queue
+    queue = load_contacts()
+    state.update({"index": None, "active": False, "log": []})
+    await update.message.reply_text(
+        f"🔄 *Reloaded* — {len(queue)} contacts loaded\n\nSend /start to begin.",
+        parse_mode="Markdown"
+    )
+
+async def cmd_help(update, ctx):
+    await update.message.reply_text(
+        "📖 *AutoDial Commands*\n\n"
+        "/start — begin or resume session\n"
+        "/end — mark call complete\n"
+        "/end [note] — complete with a note\n"
+        "/skip — skip current contact\n"
+        "/pause — pause the session\n"
+        "/status — see queue progress\n"
+        "/log — view all call notes\n"
+        "/export — download results as CSV\n"
+        "/reload — reload leads.csv\n"
+        "/reset — reset entire queue\n"
+        "/help — show this menu",
+        parse_mode="Markdown"
+    )
+
+def main():
+    if not TOKEN:
+        raise ValueError("TELEGRAM_TOKEN not set in .env file")
+    app = Application.builder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start",  cmd_start))
+    app.add_handler(CommandHandler("end",    cmd_end))
+    app.add_handler(CommandHandler("skip",   cmd_skip))
+    app.add_handler(CommandHandler("pause",  cmd_pause))
+    app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("log",    cmd_log))
+    app.add_handler(CommandHandler("export", cmd_export))
+    app.add_handler(CommandHandler("reset",  cmd_reset))
+    app.add_handler(CommandHandler("reload", cmd_reload))
+    app.add_handler(CommandHandler("help",   cmd_help))
+    print(f"✅ AutoDial bot running — {len(queue)} contacts loaded")
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
